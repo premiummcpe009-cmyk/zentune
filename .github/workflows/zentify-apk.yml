@@ -5,7 +5,8 @@
 #   B) the repo root already contains the project (a gradlew file at the root).
 #
 # Run it from Actions > Build Zentify APK > Run workflow. It also runs on its own
-# whenever Zentify-source.zip changes on main.
+# whenever Zentify-source.zip changes on main. The default is an optimized, signed
+# release build; with no secrets set, a signing key is created and cached automatically.
 
 name: Build Zentify APK
 
@@ -13,10 +14,10 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "debug installs with no setup; release needs the 4 signing secrets"
+        description: "release is optimized and fast (use this); debug is slow and only for troubleshooting"
         type: choice
-        options: [debug, release]
-        default: debug
+        options: [release, debug]
+        default: release
       publish_release:
         description: Attach the APK to a GitHub Release (easiest to download on a phone)
         type: boolean
@@ -41,7 +42,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VARIANT: ${{ inputs.variant || 'debug' }}
+  VARIANT: ${{ inputs.variant || 'release' }}
   PUBLISH: ${{ github.event_name == 'push' || inputs.publish_release }}
 
 jobs:
@@ -135,6 +136,15 @@ jobs:
           path: ~/.android/debug.keystore
           key: zentify-debug-keystore-v1
 
+      # Without signing secrets, a release key is generated once and kept in the Actions cache,
+      # so later builds install over earlier ones. If GitHub evicts the cache, uninstall first.
+      - name: Restore auto-generated release key
+        if: env.VARIANT == 'release'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/zentify-signing
+          key: zentify-release-keystore-v1
+
       - name: Prepare release signing
         if: env.VARIANT == 'release'
         shell: bash
@@ -145,14 +155,34 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
-            [[ -n "${!name}" ]] || { echo "::error::Repository secret $name is missing (Settings > Secrets and variables > Actions)"; exit 1; }
-          done
           umask 077
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/zentify.keystore"
-          [[ -s "$RUNNER_TEMP/zentify.keystore" ]] || { echo "::error::KEYSTORE_BASE64 decoded to an empty file"; exit 1; }
+          if [[ -n "$KEYSTORE_BASE64" ]]; then
+            for name in KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+              [[ -n "${!name}" ]] || { echo "::error::Repository secret $name is missing"; exit 1; }
+            done
+            keystore="$RUNNER_TEMP/zentify.keystore"
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+            [[ -s "$keystore" ]] || { echo "::error::KEYSTORE_BASE64 decoded to an empty file"; exit 1; }
+            echo "Using the signing key from repository secrets"
+          else
+            dir="$HOME/zentify-signing"
+            mkdir -p "$dir"
+            keystore="$dir/zentify.keystore"
+            if [[ ! -f "$keystore" || ! -f "$dir/signing.env" ]]; then
+              pass="$(openssl rand -hex 16)"
+              keytool -genkeypair -keystore "$keystore" -alias zentify -keyalg RSA -keysize 2048 \
+                -validity 10000 -storepass "$pass" -keypass "$pass" -dname "CN=Zentify, O=Zentify, C=US"
+              printf 'KEYSTORE_PASSWORD=%s\nKEY_PASSWORD=%s\nKEY_ALIAS=zentify\n' "$pass" "$pass" > "$dir/signing.env"
+              echo "::notice::Generated a new signing key. Later builds reuse it while the Actions cache keeps it."
+            else
+              echo "Reusing the cached signing key"
+            fi
+            # shellcheck disable=SC1091
+            source "$dir/signing.env"
+            echo "::add-mask::$KEYSTORE_PASSWORD"
+          fi
           {
-            echo "KEYSTORE_PATH=$RUNNER_TEMP/zentify.keystore"
+            echo "KEYSTORE_PATH=$keystore"
             echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
             echo "KEY_ALIAS=$KEY_ALIAS"
             echo "KEY_PASSWORD=$KEY_PASSWORD"
